@@ -5,7 +5,7 @@ import bpy
 import importlib
 
 
-def run_module(module_name, verbose=False):
+def run_module(module_name, verbose=False, ex_3_n = 1 ):
     blend_dir = os.path.dirname(bpy.data.filepath)
     if blend_dir not in sys.path:
         sys.path.append(blend_dir)
@@ -13,12 +13,12 @@ def run_module(module_name, verbose=False):
     module = importlib.import_module(module_name)
     importlib.reload(module)
     if hasattr(module, "main"):
-        module.main(verbose)
+        module.main(verbose, ex_3_n)
     else:
         print(f"{module_name} has no main()")
 
 
 print("------------------------------------------------------Running")
-run_module("lab_3", verbose=False)
+run_module("lab_3", verbose=False, ex_3_n = 4)
 
 print("------------------------------------------------------Finished")

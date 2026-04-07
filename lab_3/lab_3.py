@@ -3,13 +3,15 @@ import bmesh
 
 from mathutils import Vector
 from time import time
-from utils import print_vector
 
-# from utils import UnionFind
+# from utils import print_vector
 
 
+# https://docs.blender.org/manual/en/4.5/modeling/modifiers/generate/subdivision_surface.html
 # https://www.youtube.com/watch?v=mfp1Z1mBClc
 # https://www.youtube.com/watch?v=kC8jbGSiuIQ
+# https://www.youtube.com/watch?v=mX0NB9IyYpU
+# https://people.eecs.berkeley.edu/~sequin/CS284/PAPERS/CatmullClark_SDSurf.pdf
 
 
 class MeshTopology:
@@ -17,10 +19,16 @@ class MeshTopology:
         self,
         me: bpy.types.Mesh,
     ):
+
         # Create a Bmesh instance from regular mesh
         self.me = me
         self.bm = bmesh.new()  # create an empty BMesh
         self.bm.from_mesh(me)  # fill it in from a Mesh
+
+        # We are going to store the two different information types of the subdivision
+        # process to perform animation
+        self.pos_simple_subdivision: dict[bmesh.types.BMVert, Vector] = {}
+        self.pos_catmull_clark: dict[bmesh.types.BMVert, Vector] = {}
 
     def clean_up(self):
         # Finish up, write the bmesh back to the mesh
@@ -35,53 +43,75 @@ class MeshTopology:
     def simple_subdivision(self):
         """
         Function that modifies the mesh associated to the active object performing
-        one step of topological subdivision of the mesh (as defined by Catmull-Clark),
-        but without perturbing the positions.
-
-        https://en.wikipedia.org/wiki/Catmull%E2%80%93Clark_subdivision_surface
+        one step of topological simple subdivision of the mesh (similar to Catmull-Clark
+        but without perturbing the positions,
+        https://en.wikipedia.org/wiki/Catmull%E2%80%93Clark_subdivision_surface )
 
         New vertices will be at the barycenter of each face and at the midpoint of
         each edge. (What blender calls “Simple” subdivision).
 
         The input mesh may contain faces of any arity.
-        The result should be made of quads only. ()
+        The result should be made of quads only.
         The original mesh is assumed to be 2-manifold without boundary
 
-        The modified Bmesh keeps the original faces in order to ease other exercises
+        The modified Bmesh keeps the original faces and edges as they are needed in the
+        Catmull-Clark calculation step
         """
         t = time()
-        # Useful for catmull clark stuff
-        original_points = {vert: len(vert.link_edges) for vert in list(self.bm.verts)}
 
-        # 1. For each face, add a face point (use barycenter of original points)
+        # 0. Save original elements before modifying the mesh (useful for future steps)
+        # list creates a copy
+        self.original_verts = {v: len(v.link_edges) for v in self.bm.verts}
+        self.original_edges = list(self.bm.edges)
+        self.original_faces = list(self.bm.faces)
+
+        # 1. Generate Face Points
+        # For each face, add a face point (using barycenter of original points)
         # print("Faces")
-        new_face_points: dict[bmesh.types.BMFace, bmesh.types.BMVert] = {}
-        for face in self.bm.faces:
-            center_placeholder = Vector((0, 0, 0))
-            vert_count = len(face.verts)
-            for vert in face.verts:
-                center_placeholder += vert.co
-            center = center_placeholder / vert_count
+        new_face_verts: dict[bmesh.types.BMFace, bmesh.types.BMVert] = {}
+        for face in self.original_faces:
+            center = face.calc_center_median()
+            # center_placeholder = Vector((0, 0, 0))
+            # vert_count = len(face.verts)
+            # for vert in face.verts:
+            #     center_placeholder += vert.co
+            # center = center_placeholder / vert_count
             # print_vector("Center:", center)
-            # Create new geometry and save it in a F:{V}  way
-            new_face_points[face] = self.bm.verts.new(center)
             # print("----------------------------")
 
-        # 2. For each edge, add an edge point (use midpoint of original points)
+            # Create new geometry and save it in a F:{V} way
+            new_vertex = self.bm.verts.new(center)
+            new_face_verts[face] = new_vertex
+            # Save simple subdivision positions
+            self.pos_simple_subdivision[new_vertex] = center
+
+        # 2. Generate Edge Points (Midpoints)
+        # For each edge, add an edge point (use midpoint of original points)
         # print("Edges")
-        new_edge_points: dict[bmesh.types.BMEdge, bmesh.types.BMVert] = {}
-        for edge in self.bm.edges:
-            center_placeholder = Vector((0, 0, 0))
-            for vert in edge.verts:
-                center_placeholder += vert.co
-            # Number of vertices for an edge should be 2
-            center = center_placeholder / 2
-            # print_vector("Center:", center)
-            # Create new geometry and save it in a E:{V} way (kind of)
-            new_edge_points[edge] = self.bm.verts.new(center)
-            # print("----------------------------")
+        new_edge_verts: dict[bmesh.types.BMEdge, bmesh.types.BMVert] = {}
+        for edge in self.original_edges:
+            # midpoint_placeholder = Vector((0, 0, 0))
+            # for vert in edge.verts:
+            #     midpoint_placeholder += vert.co
+            # # Number of vertices for an edge should be 2
+            # midpoint = midpoint_placeholder / 2
+            # # print_vector("Midpoint:", midpoint)
+            # # print("----------------------------")
 
-        # 3. Connect each new face point to the new edge points of all original
+            # Accessing Bmesh by index is dangerous but it should not matter here
+            midpoint = (edge.verts[0].co + edge.verts[1].co) / 2
+            new_vertex = self.bm.verts.new(midpoint)
+            # Create new geometry and save it in a E:{V} way (kind of, actually E:{V.co})
+            new_edge_verts[edge] = new_vertex
+            # Save simple subdivision positions
+            self.pos_simple_subdivision[new_vertex] = midpoint
+
+        # 3. Save simple subdivision position for original vertices
+        for vertex in self.original_verts:
+            self.pos_simple_subdivision[vertex] = vertex.co.copy()
+
+        # 4. Create the Quad Topology
+        # Connect each new face point to the new edge points of all original
         # edges defining the original face
 
         # The  quads are ensured by creating a new face for every loop (corner)
@@ -91,39 +121,28 @@ class MeshTopology:
         # mp_ne: new vertex created in the midpoint wrt the next edge
         # p_f: new vertex created in the barycenter of the face
         # mp_pe:new vertex created in the midpoint wrt the previous edge
-
-        # This avoids iterating over the list we need to update
-        original_faces = list(self.bm.faces)
-
-        new_faces = []
-        for face in original_faces:
-            p_f = new_face_points[face]
+        for face in self.original_faces:
+            p_f = new_face_verts[face]
             for loop in face.loops:
-                p_o = loop.vert
-                mp_ne = new_edge_points[loop.edge]
-                # p_f = new_face_points[face]
-                mp_pe = new_edge_points[loop.link_loop_prev.edge]
+                p_o = loop.vert  # v1
+                mp_ne = new_edge_verts[loop.edge]  # v2
+                # p_f = new_face_points[face] # v3
+                mp_pe = new_edge_verts[loop.link_loop_prev.edge]  # v4
 
                 # Create new face (order matters!)
-                new_face = self.bm.faces.new((p_o, mp_ne, p_f, mp_pe))
-                new_faces.append(new_face)
+                self.bm.faces.new((p_o, mp_ne, p_f, mp_pe))
 
-        # for loop in self.bm.loops:
-        #     print(loop)
+        return time() - t, new_face_verts, new_edge_verts
 
-        return time() - t, new_face_points, new_edge_points, original_points
-
-    def move_points(
+    def calculate_catmull_clark_positions(
         self,
-        new_face_points: dict[bmesh.types.BMFace, bmesh.types.BMVert],
-        new_edge_points: dict[bmesh.types.BMEdge, bmesh.types.BMVert],
-        original_points: dict[bmesh.types.BMVert, int],
+        new_face_verts: dict[bmesh.types.BMFace, bmesh.types.BMVert],
+        new_edge_verts: dict[bmesh.types.BMEdge, bmesh.types.BMVert],
     ):
         """
-        Catmull-Clark subdivision
-        Function that applies one step of Catmull-Clark subdivision to the active
+        Function that calculates one step of Catmull-Clark subdivision to the active
         object.
-
+        No relocation is performed in this function. Info is saved in self.pos_catmull_clark
         simple_subdivision() must be used before to prepare the topology
 
 
@@ -135,7 +154,6 @@ class MeshTopology:
         p_o: original vertices
 
         Algorithm:
-
         1. p_f positions are conserved after creation. (Already done in
             simple_subdivision())
         2. mp_e position needs to be re-calculated based on the barycenter using
@@ -149,68 +167,104 @@ class MeshTopology:
             R: centroid of adjacent mp_e's
             V: p_o
 
-        4. Apply mp_e_new and p_o_new. (This is done after previous calculation to avoid
-            "polluting" calculations.
+        4. Clean topology (erase original faces and edges)
 
-        TODO: Confirm if p_o updating is based on original midpoint or translated
-            adjacnet mp_e's
         """
         t = time()
-        # 1. p_f positions
-        # No need to do anything
-        # new_face_points
 
-        # 2.calculate mp_e_new
-        mp_e_new = {}
-        for edge, vert in new_edge_points.items():
+        # 1. Face Points
+        # These are not relocated
+        for face, vertex in new_face_verts.items():
+            self.pos_catmull_clark[vertex] = vertex.co.copy()
+
+        # 2. Recalculate Edge Points position
+        # mp_e_new
+        for edge, vertex in new_edge_verts.items():
             # (p_e1 + p_e2 + p_f1 + p_f2)
             needed_points = []
-            # Get the coords of p_e1 and p_e2
+            # Get the coords of p_e1 and p_e2 (original edge vertices)
             for p_e in edge.verts:
                 needed_points.append(p_e.co)
 
             # We assume 2-manifold. This should bring 2 faces always
             for adjacent_face in edge.link_faces:
-                needed_points.append(new_face_points[adjacent_face].co)
+                needed_points.append(new_face_verts[adjacent_face].co)
 
-            if len(needed_points) != 4:
-                raise Exception(
-                    "Calculation of mp_e new location expects only 4 values"
-                )
-            # print(f"Vert {vert.co}: {needed_points}")
+            # print(f"Vert {vertex.co}: {needed_points}")
             # print("_________________")
-            mp_e_new[vert] = sum(needed_points, Vector()) / 4
-            # vert.co = mp_e_new[vert]
-        # print(mp_e_new)
+            # if len(needed_points) != 4:
+            #     raise Exception(
+            #         "Calculation of mp_e new location expects only 4 values"
+            #     )
+            self.pos_catmull_clark[vertex] = sum(needed_points, Vector()) / 4
 
-        # 3. Calcula p_o_new
-        p_o_new = {}
-        print("Original")
-        adjacent_p_f = []
-        for vert, m in original_points.items():
-            print(vert.co, m, len(vert.link_edges), len(vert.link_faces))
-            # Get adjacent new faces. (Because we )
-            for f in vert.link_faces:
-                aux = new_face_points.get(f)
-                if aux:
-                    adjacent_p_f.append()
+        # 3. Recalculate Original Vertex position
+        # p_o_new
+        for vertex, m in self.original_verts.items():
+            # These lookups are probably quite costly but...
+            # If there is enough time i could try to build V: {new_edges} and V:{new_faces}
+            # F: Centroid of Vf  (average of adjacent Face Points)
+            adj_face_points = [
+                new_face_verts[f].co for f in vertex.link_faces if f in new_face_verts
+            ]
+            F = sum(adj_face_points, Vector()) / len(adj_face_points)
 
-        # F = ...
+            # R: centroid of edge midpoints (average of adjacent original Edge Midpoints)
+            adj_edges_mp = [
+                new_edge_verts[e].co for e in vertex.link_edges if e in new_edge_verts
+            ]
+            R = sum(adj_edges_mp, Vector()) / len(adj_edges_mp)
 
-        #
-        # R = ...
-        #
-        # V = ...
-        #  current vertex position
-        # V = v.co
+            # V: original position
+            V = vertex.co
 
-        # # Apply the formula
-        # p_o_new[v] = (F + 2 * R + (n - 3) * V) / n
+            # print(vertex.co, m)
+            # print(F, len(adj_face_points), adj_face_points)
+            # print(R, len(adj_edges_mp), adj_edges_mp)
+            # print("-----------------------")
+            # Apply the weighted barycenter
+            p_o_new = (F + (2 * R) + ((m - 3) * V)) / m
+            
+            # Other weights
+            # p_o_new = (F + (2 * R) + ((2 * m - 3) * V)) / (2 * m)
+
+            self.pos_catmull_clark[vertex] = p_o_new
+
+        bmesh.ops.delete(self.bm, geom=self.original_faces, context="FACES_ONLY")
+        bmesh.ops.delete(self.bm, geom=self.original_edges, context="EDGES")
 
         return time() - t
 
+    def apply_interpolation(self, t: float):
+        """
+        This function relocates the vertices following the calculation from
+        simple_subdivision() and calculate_catmull_clark_positions()
 
-def main(verbose=True):
+        Linear Interpolation between Simple subdivision(P0) and Catmull-Clark(P1)
+        t = 0.0 -> Simple subdivision
+        t = 1.0 -> Catmull-Clark
+
+        """
+        time_1 = time()
+        if t < 0 or t > 1:
+            raise ValueError("t value must be between 0 and 1 (inclusive)")
+
+        for v in self.bm.verts:
+            # This works for:
+            #   - Face vertices(as p0 = p1 and it does not change)
+            #   - Edge vertices(going from the midpoint of the edge to the Catmull-Clark pos)
+            #   - Original vertices( p0 original pos to p1 weighted barycenter)
+            if v in self.pos_simple_subdivision and v in self.pos_catmull_clark:
+                p0 = self.pos_simple_subdivision[v]
+                p1 = self.pos_catmull_clark[v]
+                p_t = (1 - t) * p0 + t * p1
+                # Apply the change
+                v.co = p_t
+
+        return time() - time_1
+
+
+def main(verbose=True, ex_3_n: int = 1):
     # Get current time
     t = time()
 
@@ -223,7 +277,7 @@ def main(verbose=True):
         print(f"(It is a {ob.type})")
         return
 
-    # Go to edit mode or maybe stay in object... aparently there are subtle
+    # Go to edit mode or maybe stay in object... apparently there are subtle
     # changes on how to use bpy on each one
     bpy.ops.object.mode_set(mode="OBJECT")
 
@@ -231,39 +285,36 @@ def main(verbose=True):
     me: bpy.types.Mesh = ob.data
 
     custom_mesh = MeshTopology(me)
-    elapsed_t, new_face_points, new_edge_points, original_points = (
-        custom_mesh.simple_subdivision()
-    )
-    print(f"Simple subdivision took {elapsed_t:.3f} s")
-
-    elapsed_t = custom_mesh.move_points(
-        new_face_points, new_edge_points, original_points
-    )
-    print(f"Move points took {elapsed_t:.3f} s")
-
-    # print(f"{bm.edges=}")
-    # print(f"{bm.edges=}")
-    # print(f"{bm.faces=}")
-    # print(f"{bm.loops=}")
-    # print(f"{bm.verts=}")
-    # print(f"{bm.select_history=}")
-    # print(f"{bm.select_mode=}")
-    # print(f"{bm.is_valid=}")
-    # print(f"{bm.is_wrapped=}")
 
     # Exercise 1 — “Simple” subdivision
+    elapsed_t, new_face_points, new_edge_points = custom_mesh.simple_subdivision()
+    print(f"Simple subdivision took {elapsed_t:.3f} s")
 
-    # Modify the BMesh, can do anything here...
-    # for v in custom_mesh.bm.verts:
-    #     v.co.x += 1.0
+    # Exercise 2 — Catmull-Clark subdivision
+    elapsed_t = custom_mesh.calculate_catmull_clark_positions(
+        new_face_points, new_edge_points
+    )
+    print(f"calculate_catmull_clark_positions took {elapsed_t:.3f} s")
 
-    # # Recalculate internal index tables (CRITICAL)
-    # bm.verts.ensure_lookup_table()
+    # Exercise 3 — One-parameter family of surfaces
+    elapsed_t = custom_mesh.apply_interpolation(t=1.0)
+    print(f"First subdivision step took {elapsed_t:.3f} s")
+    print("CK iteration #1 applied")
 
-    # # Push changes back to the mesh
-    # bmesh.update_edit_mesh(me)
+    if ex_3_n > 1:
+        t_lerp = time()
+        for i in range(2, ex_3_n + 1):
+            print(f"CK iteration #{i} applied")
+            _, new_face_points, new_edge_points = custom_mesh.simple_subdivision()
+            _ = custom_mesh.calculate_catmull_clark_positions(
+                new_face_points, new_edge_points
+            )
+            custom_mesh.apply_interpolation(t=1.0)
+        print(f"CK iterations took {time()-t_lerp:.3f} s")
 
+    # Push changes back to the mesh
     custom_mesh.clean_up()
+    # Is easier to see the results in edit mode
     bpy.ops.object.mode_set(mode="EDIT")
     # Report performance...
     print(f"Script took: {time() - t:.3f} s")
