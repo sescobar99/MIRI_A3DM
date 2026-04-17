@@ -1,17 +1,102 @@
 import bpy
 import bmesh
 
+from bpy.app.handlers import persistent
 from mathutils import Vector
 from time import time
 
-# from utils import print_vector
 
-
+# Subdivision Surface Modifier
 # https://docs.blender.org/manual/en/4.5/modeling/modifiers/generate/subdivision_surface.html
+# Implementing Catmull-Clark Subdivision - Introduction & Rules
 # https://www.youtube.com/watch?v=mfp1Z1mBClc
+# Subdivision surfaces in 5 minutes
 # https://www.youtube.com/watch?v=kC8jbGSiuIQ
+# Math and Movies (Animation at Pixar) - Numberphile
 # https://www.youtube.com/watch?v=mX0NB9IyYpU
+# Recursively generated B-spline surfaces on arbitrary topological meshes
 # https://people.eecs.berkeley.edu/~sequin/CS284/PAPERS/CatmullClark_SDSurf.pdf
+
+# How to Render Your 3d Animation to a Video File (Blender Tutorial)
+# https://www.youtube.com/watch?v=OENbinegV2c
+# Blender doesn't use GPU when rendering with Cycles
+# https://www.reddit.com/r/blender/comments/14tezr9/blender_doesnt_use_gpu_when_rendering_with_cycles/
+# How to - Orbit & Rotate Your Camera Around an Object : Blender 4.5
+# https://www.youtube.com/watch?v=A62Exb4Hheg
+# BEGINNERS Guide to Rendering in Blender (it's really simple)
+# https://www.youtube.com/watch?v=APmw2Q8kBOM
+
+# Global dictionary to store our animation data so the handler can access it
+# In a professional addon, you'd store this in Scene properties or a Singleton
+START_FRAME = 1
+END_FRAME = 100
+anim_data = {
+    "me_name": "",
+    "simple_coords": [],
+    "cc_coords": [],
+    "start_frame": START_FRAME,
+    "end_frame": END_FRAME,
+}
+
+def subdivision_animation_callback(scene: bpy.types.Scene):
+    """
+    Callback function that runs every frame animating the mesh interpolation
+    """
+    # 1. Confirm the mesh to animate exists
+    me = bpy.data.meshes.get(anim_data["me_name"])
+    if not me or not anim_data["simple_coords"]:
+        return
+
+    # 2. Calculate interpolation factor based on current frame
+    start = anim_data["start_frame"]
+    end = anim_data["end_frame"]
+    curr = scene.frame_current
+    # Normalize and clamp
+    t = max(0.0, min(1.0, (curr - start) / (end - start)))
+
+    # 3. Update vertex positions
+    # This way of updating the vertices is less intuitive but more efficient 
+    t_coords = []
+    for p0, p1 in zip(anim_data["simple_coords"], anim_data["cc_coords"]):
+        p_t = (1 - t) * p0 + t * p1
+        t_coords.extend(p_t)  # Flatten for foreach_set
+    me.vertices.foreach_set("co", t_coords)
+    me.update()
+
+
+def setup_animation(me: bpy.types.Mesh, n_iterations, start_f, end_f):
+    """
+    Prepares the mesh and registers the animation handler
+    """
+    custom_mesh = MeshTopology(me)
+
+    # 1. Perform 'n' iterations of subdivision to get the final topology
+    for _ in range(n_iterations):
+        _, nfp, nep = custom_mesh.simple_subdivision()
+        custom_mesh.calculate_catmull_clark_positions(nfp, nep)
+        # Apply t=1.0 so the next iteration starts from the appropriate location
+        custom_mesh.apply_interpolation(t=1)
+
+    # 2. Store the final state coordinates for the callback
+    # We need the Simple positions (t=0) and CC positions (t=1) of the FINAL topology
+    verts = custom_mesh.bm.verts
+    verts.ensure_lookup_table()
+
+    anim_data["me_name"] = me.name
+    anim_data["simple_coords"] = [
+        custom_mesh.pos_simple_subdivision[v].copy() for v in verts
+    ]
+    anim_data["cc_coords"] = [custom_mesh.pos_catmull_clark[v].copy() for v in verts]
+    anim_data["start_frame"] = start_f
+    anim_data["end_frame"] = end_f
+
+    # 3. Clean up BMesh and write to Mesh
+    custom_mesh.clean_up()
+
+    # Register the handler
+    # Remove existing handlers first to avoid duplicates
+    bpy.app.handlers.frame_change_pre.clear()
+    bpy.app.handlers.frame_change_pre.append(subdivision_animation_callback)
 
 
 class MeshTopology:
@@ -196,7 +281,16 @@ class MeshTopology:
             #     raise Exception(
             #         "Calculation of mp_e new location expects only 4 values"
             #     )
+            # Original weight
             self.pos_catmull_clark[vertex] = sum(needed_points, Vector()) / 4
+
+            # Other weights
+            # self.pos_catmull_clark[vertex] = (
+            #     (2 * needed_points[0])
+            #     + (2 * needed_points[1])
+            #     + needed_points[2]
+            #     + needed_points[3]
+            # ) / 6
 
         # 3. Recalculate Original Vertex position
         # p_o_new
@@ -224,9 +318,24 @@ class MeshTopology:
             # print("-----------------------")
             # Apply the weighted barycenter
             p_o_new = (F + (2 * R) + ((m - 3) * V)) / m
-            
+
+            # Catmull-Clark paper
+            # (A) New face points - the average of all of the old points
+            # defining the face.
+            # (B) New edge points - the average of the midpoints of
+            # the old edge with the average of the two new face
+            # points of the faces sharing the edge.
+            # (C) New vertex points - the average
+            # Q/n + 2R/n + S(n-3)/n
+            # Q = the average of the new face points of all faces
+            # adjacent to the old vertex point.
+            # R = the average of the midpoints of all old edges
+            # incident on the old vertex point.
+            # S = old vertex point.
+
             # Other weights
             # p_o_new = (F + (2 * R) + ((2 * m - 3) * V)) / (2 * m)
+            # p_o_new = (F / 4) + (R / 2) + (V / 4)
 
             self.pos_catmull_clark[vertex] = p_o_new
 
@@ -277,45 +386,53 @@ def main(verbose=True, ex_3_n: int = 1):
         print(f"(It is a {ob.type})")
         return
 
-    # Go to edit mode or maybe stay in object... apparently there are subtle
+    # Go to edit mode... or maybe stay in object mode... apparently there are subtle
     # changes on how to use bpy on each one
     bpy.ops.object.mode_set(mode="OBJECT")
 
     # Retrieve the mesh data
     me: bpy.types.Mesh = ob.data
+    # custom_mesh = MeshTopology(me)
 
-    custom_mesh = MeshTopology(me)
+    # # Exercise 1 — “Simple” subdivision
+    # elapsed_t, new_face_points, new_edge_points = custom_mesh.simple_subdivision()
+    # print(f"Simple subdivision took {elapsed_t:.3f} s")
 
-    # Exercise 1 — “Simple” subdivision
-    elapsed_t, new_face_points, new_edge_points = custom_mesh.simple_subdivision()
-    print(f"Simple subdivision took {elapsed_t:.3f} s")
+    # # Exercise 2 — Catmull-Clark subdivision
+    # elapsed_t = custom_mesh.calculate_catmull_clark_positions(
+    #     new_face_points, new_edge_points
+    # )
+    # print(f"calculate_catmull_clark_positions took {elapsed_t:.3f} s")
 
-    # Exercise 2 — Catmull-Clark subdivision
-    elapsed_t = custom_mesh.calculate_catmull_clark_positions(
-        new_face_points, new_edge_points
-    )
-    print(f"calculate_catmull_clark_positions took {elapsed_t:.3f} s")
+    # # Exercise 3 — One-parameter family of surfaces
+    # elapsed_t = custom_mesh.apply_interpolation(t=1.0)
+    # print(f"First subdivision step took {elapsed_t:.3f} s")
+    # print("CK iteration #1 applied")
 
-    # Exercise 3 — One-parameter family of surfaces
-    elapsed_t = custom_mesh.apply_interpolation(t=1.0)
-    print(f"First subdivision step took {elapsed_t:.3f} s")
-    print("CK iteration #1 applied")
+    # if ex_3_n > 1:
+    #     t_lerp = time()
+    #     for i in range(2, ex_3_n + 1):
+    #         print(f"CK iteration #{i} applied")
+    #         _, new_face_points, new_edge_points = custom_mesh.simple_subdivision()
+    #         _ = custom_mesh.calculate_catmull_clark_positions(
+    #             new_face_points, new_edge_points
+    #         )
+    #         custom_mesh.apply_interpolation(t=1.0)
+    #     print(f"CK iterations took {time()-t_lerp:.3f} s")
 
-    if ex_3_n > 1:
-        t_lerp = time()
-        for i in range(2, ex_3_n + 1):
-            print(f"CK iteration #{i} applied")
-            _, new_face_points, new_edge_points = custom_mesh.simple_subdivision()
-            _ = custom_mesh.calculate_catmull_clark_positions(
-                new_face_points, new_edge_points
-            )
-            custom_mesh.apply_interpolation(t=1.0)
-        print(f"CK iterations took {time()-t_lerp:.3f} s")
+    # Exercise 4 — Tweak parameters
+    # Code with different weights commented + lab3.blend file with results
+
+    # Exercise 5 - ANimate interpolation using t parameter.
+    setup_animation(ob, n_iterations=1, start_f=START_FRAME, end_f=END_FRAME)
+    bpy.context.scene.frame_start = START_FRAME
+    bpy.context.scene.frame_end = END_FRAME
+    bpy.context.scene.frame_set(1)
 
     # Push changes back to the mesh
-    custom_mesh.clean_up()
-    # Is easier to see the results in edit mode
-    bpy.ops.object.mode_set(mode="EDIT")
+    # custom_mesh.clean_up()
+    # # Is easier to see the results in edit mode
+    # bpy.ops.object.mode_set(mode="EDIT")
     # Report performance...
     print(f"Script took: {time() - t:.3f} s")
 
