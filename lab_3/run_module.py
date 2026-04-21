@@ -19,6 +19,6 @@ def run_module(module_name, verbose=False, ex_3_n = 1 ):
 
 
 print("------------------------------------------------------Running")
-run_module("lab_3", verbose=False, ex_3_n = 1)
+run_module("lab_3")
 
 print("------------------------------------------------------Finished")

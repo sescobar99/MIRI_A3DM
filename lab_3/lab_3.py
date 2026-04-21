@@ -1,7 +1,6 @@
 import bpy
 import bmesh
 
-from bpy.app.handlers import persistent
 from mathutils import Vector
 from time import time
 
@@ -27,16 +26,24 @@ from time import time
 # https://www.youtube.com/watch?v=APmw2Q8kBOM
 
 # Global dictionary to store our animation data so the handler can access it
-# In a professional addon, you'd store this in Scene properties or a Singleton
-START_FRAME = 1
-END_FRAME = 100
+FPS = 24
+TOTAL_LENGTH_SECONDS = 30
+TOTAL_FRAMES = FPS * TOTAL_LENGTH_SECONDS
+CATMULL_CLARK_STEPS = 4
+FRAMES_PER_STEP = int(TOTAL_FRAMES // CATMULL_CLARK_STEPS)  # int for up to 5 steps
+
+
 anim_data = {
     "me_name": "",
-    "simple_coords": [],
-    "cc_coords": [],
-    "start_frame": START_FRAME,
-    "end_frame": END_FRAME,
+    "iterations": [],
+    # this is a list of dicts with the form of: {
+    #     "bm": BMesh,
+    #     "pos_simple_subdivision": [coords],
+    #     "pos_catmull_clark": [coords],
+    # }
+    "frames_per_step": FRAMES_PER_STEP,
 }
+
 
 def subdivision_animation_callback(scene: bpy.types.Scene):
     """
@@ -44,59 +51,81 @@ def subdivision_animation_callback(scene: bpy.types.Scene):
     """
     # 1. Confirm the mesh to animate exists
     me = bpy.data.meshes.get(anim_data["me_name"])
-    if not me or not anim_data["simple_coords"]:
+    if not me or not anim_data["iterations"]:
         return
 
     # 2. Calculate interpolation factor based on current frame
-    start = anim_data["start_frame"]
-    end = anim_data["end_frame"]
-    curr = scene.frame_current
-    # Normalize and clamp
-    t = max(0.0, min(1.0, (curr - start) / (end - start)))
+    current_frame = scene.frame_current
+    step_duration = anim_data["frames_per_step"]
 
-    # 3. Update vertex positions
-    # This way of updating the vertices is less intuitive but more efficient 
+    iteration_index = int(current_frame // step_duration)
+    iteration_index = max(0, min(iteration_index, len(anim_data["iterations"]) - 1))
+    t = (current_frame % step_duration) / step_duration
+
+    # 3. Get the data for this specific step
+    data = anim_data["iterations"][iteration_index]
+    data["bm"].to_mesh(me)
+
+    # 4. Update vertex positions (interpolate)
+    p0_list = data["p0"]
+    p1_list = data["p1"]
     t_coords = []
-    for p0, p1 in zip(anim_data["simple_coords"], anim_data["cc_coords"]):
+    for p0, p1 in zip(p0_list, p1_list):
         p_t = (1 - t) * p0 + t * p1
         t_coords.extend(p_t)  # Flatten for foreach_set
+    # This way of updating the vertices is less intuitive but more efficient
     me.vertices.foreach_set("co", t_coords)
     me.update()
 
 
-def setup_animation(me: bpy.types.Mesh, n_iterations, start_f, end_f):
+def setup_animation(me: bpy.types.Mesh):
     """
     Prepares the mesh and registers the animation handler
     """
-    custom_mesh = MeshTopology(me)
+    anim_data["me_name"] = me.name
+    current_me = me
 
     # 1. Perform 'n' iterations of subdivision to get the final topology
-    for _ in range(n_iterations):
+    for _ in range(CATMULL_CLARK_STEPS):
+        custom_mesh = MeshTopology(me)
         _, nfp, nep = custom_mesh.simple_subdivision()
         custom_mesh.calculate_catmull_clark_positions(nfp, nep)
+
+        bm_copy = custom_mesh.bm.copy()
+        verts = bm_copy.verts
+        verts.ensure_lookup_table()
+
+        iteration_entry = {
+            "bm": bm_copy,
+            "p0": [
+                custom_mesh.pos_simple_subdivision[v].copy()
+                for v in custom_mesh.bm.verts
+            ],
+            "p1": [
+                custom_mesh.pos_catmull_clark[v].copy() for v in custom_mesh.bm.verts
+            ],
+        }
+        anim_data["iterations"].append(iteration_entry)
+
         # Apply t=1.0 so the next iteration starts from the appropriate location
         custom_mesh.apply_interpolation(t=1)
 
-    # 2. Store the final state coordinates for the callback
-    # We need the Simple positions (t=0) and CC positions (t=1) of the FINAL topology
-    verts = custom_mesh.bm.verts
-    verts.ensure_lookup_table()
-
-    anim_data["me_name"] = me.name
-    anim_data["simple_coords"] = [
-        custom_mesh.pos_simple_subdivision[v].copy() for v in verts
-    ]
-    anim_data["cc_coords"] = [custom_mesh.pos_catmull_clark[v].copy() for v in verts]
-    anim_data["start_frame"] = start_f
-    anim_data["end_frame"] = end_f
-
-    # 3. Clean up BMesh and write to Mesh
-    custom_mesh.clean_up()
-
+        # Temporary mesh update to feed into the next loop iteration
+        custom_mesh.bm.to_mesh(current_me)
+        current_me.update()
+        # Clean up the BMesh instance for this loop, but our copy in anim_data persists
+        custom_mesh.bm.free()
+   
     # Register the handler
     # Remove existing handlers first to avoid duplicates
     bpy.app.handlers.frame_change_pre.clear()
     bpy.app.handlers.frame_change_pre.append(subdivision_animation_callback)
+
+    # Adjust scene timeline
+    bpy.context.scene.frame_start = 1
+    #This avoids the last frame to look bad because of the % operation
+    bpy.context.scene.frame_end = TOTAL_FRAMES - 1 
+    bpy.context.scene.frame_set(1)
 
 
 class MeshTopology:
@@ -424,10 +453,8 @@ def main(verbose=True, ex_3_n: int = 1):
     # Code with different weights commented + lab3.blend file with results
 
     # Exercise 5 - ANimate interpolation using t parameter.
-    setup_animation(ob, n_iterations=1, start_f=START_FRAME, end_f=END_FRAME)
-    bpy.context.scene.frame_start = START_FRAME
-    bpy.context.scene.frame_end = END_FRAME
-    bpy.context.scene.frame_set(1)
+    setup_animation(me)
+
 
     # Push changes back to the mesh
     # custom_mesh.clean_up()
