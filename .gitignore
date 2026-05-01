@@ -2,3 +2,7 @@
 
 __pycache__
 renders/
+
+lab_4/MeshViewer_*/build/
+lab_4/MeshViewer_*/lib/
+lab_4/MeshViewer_*/include/
